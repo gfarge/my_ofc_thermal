@@ -32,14 +32,29 @@ class ThermalOFC():
 
         # Initialize time and logging
         self.time = 0.0  # current time [time]
+        self.log_time = -np.inf  # log of current time, initialized to -inf for log-space creep
         self.logged_states = []  # list to store logged states
         self.catalog = Catalog()  # event catalog
+    
+    def summary(self):
+        print("Thermal OFC model summary:")
+        print(f"  Grid size: {self.Nx} x {self.Nx}\n")
+        print(f"  Dissipation (d): {self.d:.1e}")
+        print(f"  Threshold disorder (delta_th): {self.delta_th:.1e}")
+        print(f"  Loading velocity (v): {self.v:.1e} length/time")
+        print(f"  Derived stiffness (K): {self.K:.2e} stress/length")
+        print(f"  Derived loading rate: {self.loading_rate:.2e} stress/time\n")
+        print(f"  Attempt frequency (omega_0): {self.omega_0:.1e} 1/time")
+        print(f"  Thermal activation scale (theta): {self.theta:.1e} stress\n")
+        print(f"  Time scale ratio (omega_0 * theta / loading_rate): {self.omega_0 * self.theta / self.loading_rate:.2e} (dimensionless)")
 
     def step_athermal(self):
         """Advance the simulation by one time step : loading + event."""
         # Compute the "excitation spectrum": the stress gap between local threshold and stress
         self.stress_gaps = self.thresholds - self.stress  # stress gap [stress]
-        self.stress_gaps = np.maximum(self.stress_gaps, 0.0)  # ensures non-negative gaps (numerical errors)
+        if np.any(self.stress_gaps < 0):
+            print("Some negative stress gaps detected")
+        # self.stress_gaps = np.maximum(self.stress_gaps, 0.0)  # ensures non-negative gaps (numerical errors)
 
         # Time to ATHERMAL event : find the minimum stress gap, compute delta_t
         min_gap = np.min(self.stress_gaps)  # minimum stress gap [stress]
@@ -51,6 +66,7 @@ class ThermalOFC():
 
         # Advance time and apply tectonic loading
         self.time += delta_t
+        self.log_time = np.log(self.time)  # update log_time for consistency, even though it's not used in athermal steps
         self.stress += self.loading_rate * delta_t
 
         # Run avalanche cascade
@@ -60,12 +76,110 @@ class ThermalOFC():
         self.catalog.add_event(event)
         
         return event, self.time
+    
+    def creep(self):
+        """Let the system creep for one time step: the system evolves only through thermal activation, without tectonic loading."""
+        # Compute the "excitation spectrum": the stress gap between local threshold and stress
+        self.stress_gaps = self.thresholds - self.stress  # stress gap [stress]
+        if np.any(self.stress_gaps < 0):
+            print("Some negative stress gaps detected")
+        # self.stress_gaps = np.maximum(self.stress_gaps, 0.0)  # ensures non-negative gaps (numerical errors)
+
+        # Time to THERMAL event : activation spectrum and delta_t sampling
+        activation_values = self.omega_0 * np.exp(-self.stress_gaps / self.theta)  # activation spectrum (rate of thermal events for each cell)
+        if np.all(activation_values == 0):  # checking for infinite waiting times
+            print("Terminating creep: no thermal events possible")
+            return None, np.inf
+
+        # Compute time to thermal event for each cell and select the minimum
+        u = np.random.rand(self.Nx, self.Nx)  # uniform variable for sampling
+        delta_t_thermal = - 1 / activation_values * np.log(u)  # time to thermal event for each cell [time], computed for Poisson process with rate given by activation spectrum
+
+        rupture_type = 'thermal'
+        delta_t = np.min(delta_t_thermal)  # select time
+        initiating_idx = np.argmin(delta_t_thermal)  # index of cell that initiates the thermal event (for flat array)
+        ii_init, jj_init = np.unravel_index(initiating_idx, (self.Nx, self.Nx))  # i, j indices of initial failing cell
+
+        # Advance time (no tectonic loading)
+        self.time += delta_t
+        self.log_time = np.log(self.time)  # update log_time for consistency
+
+        # Run avalanche cascade
+        event = self._run_avalanche(ii_init, jj_init, rupture_type)
+
+        # Event logging
+        self.catalog.add_event(event)
+        
+        return event, self.time
+    
+    def creep_logtime(self):
+        """
+        Let the system creep for one time step: the system evolves only through
+        thermal activation, without tectonic loading.
+
+        All time/rate computations are performed in log-space to handle the extreme
+        dynamic range of activation rates when stress gaps are large relative to θ.
+
+        δt = -1/λ * ln(u)  =>  log(δt) = -log(λ) + log(-log(u))
+        where log(λ) = log(ω_0) - stress_gap / θ
+
+        Time is tracked as self.log_time = log(current_time) to avoid overflow
+        when individual δt values are astronomically large.
+        """
+        # --- Stress gap: x_i = threshold_i - stress_i ---
+        self.stress_gaps = self.thresholds - self.stress  # shape (Nx, Nx) [stress units]
+        if np.any(self.stress_gaps < 0):
+            print("Some negative stress gaps detected")
+
+        # --- Log-space activation rates: log(λ_i) = log(ω_0) - gap_i / θ ---
+        log_activation = np.log(self.omega_0) - self.stress_gaps / self.theta  # shape (Nx, Nx)
+
+        # Guard: if ALL rates are effectively -inf (no event possible in float64)
+        if np.all(log_activation < -745):
+            print("Terminating creep: no thermal events possible (all rates underflow)")
+            return None, self.log_time
+
+        # --- Log time-to-event: log(δt_i) = -log(λ_i) + log(-log(u_i)) ---
+        u = np.clip(np.random.rand(self.Nx, self.Nx), 1e-300, 1)  # U(0,1), guarded against exact 0
+        log_exp_sample = np.log(-np.log(u))             # log of Exp(1) sample, shape (Nx, Nx)
+        log_delta_t    = -log_activation + log_exp_sample  # log(δt) per cell, shape (Nx, Nx)
+
+        # --- Select minimum δt, equivalently minimum log(δt) ---
+        initiating_idx   = np.argmin(log_delta_t)
+        ii_init, jj_init = np.unravel_index(initiating_idx, (self.Nx, self.Nx))
+        log_dt_min       = log_delta_t[ii_init, jj_init]
+
+        # --- Advance log_time via log-sum-exp: log(t + δt) = log(t) + log(1 + exp(log(δt) - log(t))) ---
+        # Special cases: if either term dominates by many orders of magnitude, log1p(exp(...)) 
+        # reduces to the dominant term, which is numerically exact.
+        if np.isneginf(self.log_time):
+            # Edge case: t = 0 at simulation start, log(0) = -inf; time is just δt
+            self.log_time = log_dt_min
+            self.time = +np.inf  # time in linear space is not tracked during creep_logtime to avoid overflow
+        else:
+            # General case: log(t + δt) via log-sum-exp
+            log_sum_max   = max(self.log_time, log_dt_min)
+            log_sum_min   = min(self.log_time, log_dt_min)
+            self.log_time = log_sum_max + np.log1p(np.exp(log_sum_min - log_sum_max))
+            self.time = +np.inf  # time in linear space is not tracked during creep_logtime to avoid overflow
+
+        rupture_type = 'thermal'
+
+        # --- Run avalanche cascade from initiating cell ---
+        event = self._run_avalanche(ii_init, jj_init, rupture_type)
+
+        # --- Event logging ---
+        self.catalog.add_event(event)
+
+        return event, self.log_time
 
     def step(self):
         """Advance the simulation by one time step : loading + event."""
         # Compute the "excitation spectrum": the stress gap between local threshold and stress
         self.stress_gaps = self.thresholds - self.stress  # stress gap [stress]
-        self.stress_gaps = np.maximum(self.stress_gaps, 0.0)  # ensures non-negative gaps (numerical errors)
+        if np.any(self.stress_gaps < 0):
+            print("Some negative stress gaps detected")
+        #self.stress_gaps = np.maximum(self.stress_gaps, 0.0)  # ensures non-negative gaps (numerical errors)
 
         # Time to ATHERMAL event : find the minimum stress gap, compute delta_t
         min_gap = np.min(self.stress_gaps)  # minimum stress gap [stress]
@@ -93,6 +207,7 @@ class ThermalOFC():
 
         # Advance time and apply tectonic loading
         self.time += delta_t
+        self.log_time = np.log(self.time)  # update log_time for consistency
         self.stress += self.loading_rate * delta_t
 
         # Run avalanche cascade
@@ -112,14 +227,26 @@ class ThermalOFC():
         failed_ii = []
         failed_jj = []
         stress_drops = []
+                
+        # Avalanche
+        # --> Break initial cell
+        failed_ii.append(ii_init)  # record failure
+        failed_jj.append(jj_init)
         
-        # Initialize nucleation
-        self.stress[ii_init, jj_init] = self.thresholds[ii_init, jj_init]
-        
-        # Track which cells have failed (for annealed disorder reset)
-        ever_failed = np.zeros((self.Nx, self.Nx), dtype=bool)
-        
-        # Avalanche loop
+        stress_at_failure = self.stress[ii_init, jj_init].copy()  # record stress drop based on actual stress
+        stress_drops.append(stress_at_failure)  # record stress drop
+
+        neighbors_fail = self.neighbors[ii_init, jj_init]  # get neighbors
+        ii_nb = neighbors_fail[:, 0]
+        jj_nb = neighbors_fail[:, 1]
+
+        transfer = transfer_fraction * stress_at_failure  # compute transfer based on actual stress
+
+        self.stress[ii_init, jj_init] = 0.0  # reset stress of failed cell
+        np.add.at(self.stress, (ii_nb, jj_nb), transfer)  # transfer stress to neighbors
+        self.thresholds[ii_init, jj_init] = 1.0 + np.random.randn() * self.delta_th  # reset threshold of failed cell (for annealed disorder)
+
+        #  --> Loop until no more failures
         while True:
             above_threshold = self.stress >= self.thresholds
             
@@ -148,15 +275,12 @@ class ThermalOFC():
             self.stress[ii_fail, jj_fail] = 0.0
             np.add.at(self.stress, (ii_nb, jj_nb), transfers)
             
-            # Track cells for post-avalanche threshold reset
-            ever_failed[ii_fail, jj_fail] = True
-        
-        # Reset thresholds after avalanche completes
-        ii_reset, jj_reset = np.where(ever_failed)
-        self.thresholds[ii_reset, jj_reset] = 1.0 + np.random.randn(len(ii_reset)) * self.delta_th
-        
+            # Reset threshold of failed cells (for annealed disorder)
+            self.thresholds[ii_fail, jj_fail] = 1.0 + np.random.randn(len(ii_fail)) * self.delta_th
+                
         event = {
             "time": self.time,
+            "log_time": self.log_time,
             "rupture_type": rupture_type,
             "ii0": ii_init,
             "jj0": jj_init,
@@ -213,6 +337,8 @@ class Catalog():
         for event in self.events:
             event["size"] = len(event["ii"])
             event["mag"] = 2/3 * np.log10(event["stress_drops"].sum())
+            if np.isneginf(event["log_time"]):
+                event["log_time"] = np.log(event["time"])
 
     def as_df(self):
         """Return the catalog as a pandas DataFrame."""
